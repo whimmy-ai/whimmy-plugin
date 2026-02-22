@@ -1,0 +1,9 @@
+{
+  "id": "whimmy",
+  "channels": ["whimmy"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}

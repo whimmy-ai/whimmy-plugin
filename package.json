@@ -1,0 +1,55 @@
+{
+  "name": "@whimmy/openclaw-channel",
+  "version": "0.1.0",
+  "description": "Whimmy channel plugin for OpenClaw",
+  "main": "index.ts",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "src",
+    "openclaw.plugin.json"
+  ],
+  "scripts": {
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "openclaw",
+    "whimmy",
+    "channel"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.2.13"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channels": [
+      "whimmy"
+    ],
+    "installDependencies": true,
+    "channel": {
+      "id": "whimmy",
+      "label": "Whimmy",
+      "selectionLabel": "Whimmy",
+      "docsPath": "/channels/whimmy",
+      "blurb": "Whimmy multi-agent messenger channel via WebSocket.",
+      "order": 80,
+      "aliases": []
+    },
+    "install": {
+      "npmSpec": "@whimmy/openclaw-channel",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    }
+  }
+}
