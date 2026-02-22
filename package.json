@@ -1,5 +1,5 @@
 {
-  "name": "@whimmy-ai/openclaw-channel",
+  "name": "@whimmy-ai/whimmy",
   "version": "0.1.0",
   "description": "Whimmy channel plugin for OpenClaw",
   "main": "index.ts",
@@ -19,6 +19,8 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@clack/prompts": "^1.0.1",
+    "chalk": "^5.6.2",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -30,6 +32,7 @@
     "openclaw": ">=2026.2.13"
   },
   "openclaw": {
+    "id": "whimmy",
     "extensions": [
       "./index.ts"
     ],
@@ -47,7 +50,7 @@
       "aliases": []
     },
     "install": {
-      "npmSpec": "@whimmy-ai/openclaw-channel",
+      "npmSpec": "@whimmy-ai/whimmy",
       "localPath": ".",
       "defaultChoice": "npm"
     }
