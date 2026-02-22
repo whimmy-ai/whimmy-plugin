@@ -1,7 +1,6 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
-import type { OpenClawConfig } from 'openclaw/plugin-sdk';
-// import { buildChannelConfigSchema } from 'openclaw/plugin-sdk';
+import type { OpenClawConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { getWhimmyRuntime } from './runtime';
 import { resolveConnection, resolveConnectionAsync, buildWsUrl, isConfigured as isConfiguredUtil } from './utils';
 import type {
@@ -10,7 +9,16 @@ import type {
   WSEnvelope,
   HookAgentRequest,
   HookApprovalRequest,
+  HookReactRequest,
+  HookReadRequest,
   ChatChunkPayload,
+  ChatMediaPayload,
+  ChatPresencePayload,
+  ChatReactPayload,
+  ChatEditPayload,
+  ChatDeletePayload,
+  ToolLifecyclePayload,
+  ExecApprovalRequestedPayload,
   WebhookEvent,
   ResolvedAccount,
   GatewayStartContext,
@@ -74,21 +82,6 @@ async function handleHookAgent(
 
   const storePath = rt.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
 
-  // Format the inbound message envelope.
-  const envelopeOptions = rt.channel.reply.resolveEnvelopeFormatOptions(cfg);
-  const previousTimestamp = rt.channel.session.readSessionUpdatedAt({ storePath, sessionKey: route.sessionKey });
-
-  const body = rt.channel.reply.formatInboundEnvelope({
-    channel: 'Whimmy',
-    from: request.sessionKey,
-    timestamp: Date.now(),
-    body: request.message,
-    chatType: 'direct',
-    sender: { name: request.agentId, id: request.sessionKey },
-    previousTimestamp,
-    envelope: envelopeOptions,
-  });
-
   // Build media fields from attachments (following MS Teams / BlueBubbles pattern).
   const attachments = request.attachments ?? [];
   const mediaPaths = attachments.map(a => a.filePath);
@@ -96,7 +89,8 @@ async function handleHookAgent(
   const mediaTypes = attachments.map(a => a.mimeType);
 
   const ctx = rt.channel.reply.finalizeInboundContext({
-    Body: body,
+    Body: request.message,
+    BodyForAgent: request.message,
     RawBody: request.message,
     CommandBody: request.message,
     From: request.sessionKey,
@@ -140,16 +134,40 @@ async function handleHookAgent(
     },
   });
 
+  // Send typing indicator.
+  const presenceTyping: ChatPresencePayload = {
+    sessionKey: request.sessionKey,
+    agentId: request.agentId,
+    status: 'typing',
+  };
+  sendEvent(ws, 'chat.presence', presenceTyping);
+
   // Dispatch to OpenClaw agent and stream responses back.
-  let lastResult: any = null;
+  let dispatchResult: { queuedFinal: boolean; counts: Record<string, number> } | null = null;
 
   try {
-    await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    dispatchResult = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx,
       cfg,
       dispatcherOptions: {
         responsePrefix: '',
         deliver: async (payload: any) => {
+          // Handle media attachments.
+          const urls: string[] = payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+          for (const url of urls) {
+            const fileName = url.split('/').pop()?.split('?')[0] || 'file';
+            const media: ChatMediaPayload = {
+              sessionKey: request.sessionKey,
+              agentId: request.agentId,
+              mediaUrl: url,
+              mimeType: payload.mimeType || 'application/octet-stream',
+              fileName,
+              audioAsVoice: payload.audioAsVoice ?? false,
+            };
+            sendEvent(ws, 'chat.media', media);
+          }
+
+          // Handle text content.
           const text = (payload.markdown || payload.text || '').trimEnd();
           if (!text) return;
 
@@ -162,24 +180,24 @@ async function handleHookAgent(
           sendEvent(ws, 'chat.chunk', chunk);
         },
       },
-      replyOptions: {
-        onComplete: (result: any) => {
-          lastResult = result;
-        },
-      },
     });
   } catch (dispatchErr: any) {
     log?.error?.(`[Whimmy] dispatch error: ${dispatchErr.message}`);
   }
 
-  // Always send chat.done after dispatch completes.
+  // Clear typing indicator and send chat.done.
+  const presenceIdle: ChatPresencePayload = {
+    sessionKey: request.sessionKey,
+    agentId: request.agentId,
+    status: 'idle',
+  };
+  sendEvent(ws, 'chat.presence', presenceIdle);
+
   const done: ChatChunkPayload = {
     sessionKey: request.sessionKey,
     agentId: request.agentId,
     content: '',
     done: true,
-    tokenCount: lastResult?.tokenCount,
-    cost: lastResult?.cost,
   };
   sendEvent(ws, 'chat.done', done);
 }
@@ -196,6 +214,51 @@ async function handleHookApproval(
   // This depends on how OpenClaw exposes approval resolution to channel plugins.
   // For now, log it — the exact API will depend on the OpenClaw SDK version.
   log?.debug?.(`[Whimmy] Approval resolution for ${request.executionId}: approved=${request.approved}, reason=${request.reason}`);
+}
+
+// ============ Inbound Event Handlers ============
+
+function handleHookReact(
+  request: HookReactRequest,
+  log?: Logger,
+): void {
+  log?.info?.(`[Whimmy] Reaction: message=${request.messageId} emoji=${request.emoji}`);
+  // Reactions from users are informational — no agent routing needed.
+}
+
+function handleHookRead(
+  request: HookReadRequest,
+  log?: Logger,
+): void {
+  log?.debug?.(`[Whimmy] Read receipt: session=${request.sessionKey} messageId=${request.messageId ?? 'latest'}`);
+}
+
+// ============ Broadcast Helper ============
+
+/** Send an event to all active WebSocket connections. */
+function broadcastEvent(event: string, payload: unknown): void {
+  for (const { ws } of activeConnections.values()) {
+    sendEvent(ws, event, payload);
+  }
+}
+
+// ============ Actions ============
+
+function createWhimmyActions(ws: WebSocket, sessionKey: string, agentId: string) {
+  return {
+    react(messageId: string, emoji: string): boolean {
+      const payload: ChatReactPayload = { sessionKey, agentId, messageId, emoji };
+      return sendEvent(ws, 'chat.react', payload);
+    },
+    edit(messageId: string, content: string): boolean {
+      const payload: ChatEditPayload = { sessionKey, agentId, messageId, content };
+      return sendEvent(ws, 'chat.edit', payload);
+    },
+    delete(messageId: string): boolean {
+      const payload: ChatDeletePayload = { sessionKey, agentId, messageId };
+      return sendEvent(ws, 'chat.delete', payload);
+    },
+  };
 }
 
 // ============ Gateway Connection ============
@@ -282,6 +345,16 @@ async function connectWebSocket(
         }
         break;
       }
+      case 'hook.react': {
+        const request = env.payload as HookReactRequest;
+        handleHookReact(request, log);
+        break;
+      }
+      case 'hook.read': {
+        const request = env.payload as HookReadRequest;
+        handleHookRead(request, log);
+        break;
+      }
       case 'ping': {
         sendEnvelope(ws, { type: 'pong' });
         break;
@@ -346,21 +419,25 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
     aliases: [],
   },
   configSchema: {
-    type: 'object',
-    properties: {
-      connectionUri: { type: 'string', description: 'Connection URI: whimmy://{token}@{host}' },
-      host: { type: 'string', description: 'Backend host (default: api.whimmy.ai)' },
-      token: { type: 'string', description: 'Connection token (alternative to connectionUri)' },
-      pairingCode: { type: 'string', description: '6-digit pairing code from Whimmy mobile app' },
-      tls: { type: 'boolean', description: 'Use TLS (default: true)' },
-      name: { type: 'string', description: 'Display name for this account' },
-      enabled: { type: 'boolean', description: 'Enable/disable this account' },
+    schema: {
+      type: 'object',
+      properties: {
+        connectionUri: { type: 'string', description: 'Connection URI: whimmy://{token}@{host}' },
+        host: { type: 'string', description: 'Backend host (default: api.whimmy.ai)' },
+        token: { type: 'string', description: 'Connection token (alternative to connectionUri)' },
+        pairingCode: { type: 'string', description: '6-digit pairing code from Whimmy mobile app' },
+        tls: { type: 'boolean', description: 'Use TLS (default: true)' },
+        name: { type: 'string', description: 'Display name for this account' },
+        enabled: { type: 'boolean', description: 'Enable/disable this account' },
+      },
+      additionalProperties: true,
     },
-    additionalProperties: true,
   },
   capabilities: {
     chatTypes: ['direct'] as Array<'direct'>,
-    reactions: false,
+    reactions: true,
+    edit: true,
+    unsend: true,
     threads: false,
     media: true,
     nativeCommands: false,
@@ -401,8 +478,64 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
       allowFrom: [],
       policyPath: 'channels.whimmy.dmPolicy',
       allowFromPath: 'channels.whimmy.allowFrom',
+      approveHint: 'All Whimmy connections are authenticated via pairing.',
     }),
   },
+  actions: {
+    listActions: () => ['send', 'sendAttachment', 'react', 'edit', 'unsend'] as any[],
+    supportsAction: ({ action }: any) =>
+      ['send', 'sendAttachment', 'react', 'edit', 'unsend'].includes(action),
+    handleAction: async ({ action, params, cfg, accountId }: any) => {
+      const id = accountId ?? 'default';
+      const conn = activeConnections.get(id);
+      if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
+        return { ok: false, error: 'Whimmy not connected' };
+      }
+      const sessionKey = typeof params.to === 'string' ? params.to : '';
+      const agentId = typeof params.agentId === 'string' ? params.agentId : 'default';
+      const actions = createWhimmyActions(conn.ws, sessionKey, agentId);
+
+      switch (action) {
+        case 'react': {
+          const messageId = typeof params.messageId === 'string' ? params.messageId : '';
+          const emoji = typeof params.emoji === 'string' ? params.emoji : '';
+          if (!messageId || !emoji) return { ok: false, error: 'Missing messageId or emoji' };
+          actions.react(messageId, emoji);
+          return { ok: true };
+        }
+        case 'edit': {
+          const messageId = typeof params.messageId === 'string' ? params.messageId : '';
+          const content = typeof params.text === 'string' ? params.text : '';
+          if (!messageId || !content) return { ok: false, error: 'Missing messageId or text' };
+          actions.edit(messageId, content);
+          return { ok: true };
+        }
+        case 'unsend': {
+          const messageId = typeof params.messageId === 'string' ? params.messageId : '';
+          if (!messageId) return { ok: false, error: 'Missing messageId' };
+          actions.delete(messageId);
+          return { ok: true };
+        }
+        case 'sendAttachment': {
+          const mediaUrl = typeof params.mediaUrl === 'string' ? params.mediaUrl : '';
+          if (!mediaUrl) return { ok: false, error: 'Missing mediaUrl' };
+          const fileName = typeof params.fileName === 'string' ? params.fileName : mediaUrl.split('/').pop()?.split('?')[0] || 'file';
+          const media: ChatMediaPayload = {
+            sessionKey,
+            agentId,
+            mediaUrl,
+            mimeType: typeof params.mimeType === 'string' ? params.mimeType : 'application/octet-stream',
+            fileName,
+            audioAsVoice: params.audioAsVoice === true,
+          };
+          sendEvent(conn.ws, 'chat.media', media);
+          return { ok: true };
+        }
+        default:
+          return { ok: false, error: `Unsupported action: ${action}` };
+      }
+    },
+  } as any,
   outbound: {
     deliveryMode: 'direct' as const,
     resolveTarget: ({ to }: any) => {
@@ -524,3 +657,37 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
     }),
   },
 };
+
+// ============ Tool Lifecycle Hooks ============
+
+/**
+ * Register plugin hooks that forward tool lifecycle events to the backend.
+ * Called from index.ts during plugin registration.
+ */
+export function registerWhimmyHooks(api: OpenClawPluginApi): void {
+  api.on('before_tool_call', (event, ctx) => {
+    if (!ctx.sessionKey) return;
+    const executionId = randomUUID();
+    const payload: ToolLifecyclePayload = {
+      sessionKey: ctx.sessionKey,
+      agentId: ctx.agentId || 'default',
+      executionId,
+      toolName: event.toolName,
+      status: 'running',
+    };
+    broadcastEvent('tool.start', payload);
+  });
+
+  api.on('after_tool_call', (event, ctx) => {
+    if (!ctx.sessionKey) return;
+    const eventName = event.error ? 'tool.error' : 'tool.done';
+    const payload: ToolLifecyclePayload = {
+      sessionKey: ctx.sessionKey,
+      agentId: ctx.agentId || 'default',
+      executionId: '',
+      toolName: event.toolName,
+      status: event.error ? 'failed' : 'completed',
+    };
+    broadcastEvent(eventName, payload);
+  });
+}

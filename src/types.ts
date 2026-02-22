@@ -90,8 +90,71 @@ export interface ChatChunkPayload {
   agentId: string;
   content: string;
   done: boolean;
+  messageId?: string;
   tokenCount?: number;
   cost?: number;
+}
+
+/** ChatMediaPayload — file or voice message sent back to backend. */
+export interface ChatMediaPayload {
+  sessionKey: string;
+  agentId: string;
+  mediaUrl: string;
+  mimeType: string;
+  fileName: string;
+  audioAsVoice: boolean;
+}
+
+/** ChatReactPayload — reaction to a message sent back to backend. */
+export interface ChatReactPayload {
+  sessionKey: string;
+  agentId: string;
+  messageId: string;
+  emoji: string;
+}
+
+/** ChatEditPayload — edit a previously sent message. */
+export interface ChatEditPayload {
+  sessionKey: string;
+  agentId: string;
+  messageId: string;
+  content: string;
+}
+
+/** ChatDeletePayload — delete a previously sent message. */
+export interface ChatDeletePayload {
+  sessionKey: string;
+  agentId: string;
+  messageId: string;
+}
+
+/** ChatReadPayload — mark messages as read. */
+export interface ChatReadPayload {
+  sessionKey: string;
+  agentId: string;
+  messageId?: string;
+}
+
+/** ChatPresencePayload — typing indicator / presence status. */
+export interface ChatPresencePayload {
+  sessionKey: string;
+  agentId: string;
+  status: 'typing' | 'idle' | 'thinking';
+}
+
+/** HookReactRequest — backend sends this when a user reacts to a message. */
+export interface HookReactRequest {
+  sessionKey: string;
+  agentId: string;
+  messageId: string;
+  emoji: string;
+}
+
+/** HookReadRequest — backend sends this when a user reads messages. */
+export interface HookReadRequest {
+  sessionKey: string;
+  agentId: string;
+  messageId?: string;
 }
 
 /** ExecApprovalRequestedPayload — approval request sent back to backend. */

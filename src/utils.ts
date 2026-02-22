@@ -7,7 +7,7 @@ const DEFAULT_HOST = 'api.whimmy.ai';
  *
  * Accepted formats:
  *   whimmy://{token}@{host}
- *   wss://{host}/api/v1/ws/gateway?token={token}
+ *   wss://{host}/api/v1/openclaw/ws?token={token}
  *   {token}@{host}   (bare shorthand)
  */
 export function parseConnectionUri(uri: string): ConnectionInfo | null {
@@ -55,7 +55,7 @@ export function parseConnectionUri(uri: string): ConnectionInfo | null {
 
 /**
  * Exchange a 6-digit pairing code for a connection token.
- * Calls POST /api/v1/pair/redeem on the backend.
+ * Calls POST /api/v1/openclaw/pair/redeem on the backend.
  */
 export async function exchangePairingCode(
   code: string,
@@ -63,7 +63,7 @@ export async function exchangePairingCode(
   tls: boolean = true,
 ): Promise<ConnectionInfo> {
   const protocol = tls ? 'https' : 'http';
-  const url = `${protocol}://${host}/api/v1/pair/redeem`;
+  const url = `${protocol}://${host}/api/v1/openclaw/pair/redeem`;
 
   const resp = await fetch(url, {
     method: 'POST',
@@ -141,7 +141,7 @@ export async function resolveConnectionAsync(
  */
 export function buildWsUrl(conn: ConnectionInfo): string {
   const protocol = conn.tls ? 'wss' : 'ws';
-  return `${protocol}://${conn.host}/api/v1/ws/gateway?token=${encodeURIComponent(conn.token)}`;
+  return `${protocol}://${conn.host}/api/v1/openclaw/ws?token=${encodeURIComponent(conn.token)}`;
 }
 
 /**

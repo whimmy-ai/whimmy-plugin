@@ -1,5 +1,5 @@
 {
-  "name": "@whimmy/openclaw-channel",
+  "name": "@whimmy-ai/openclaw-channel",
   "version": "0.1.0",
   "description": "Whimmy channel plugin for OpenClaw",
   "main": "index.ts",
@@ -47,7 +47,7 @@
       "aliases": []
     },
     "install": {
-      "npmSpec": "@whimmy/openclaw-channel",
+      "npmSpec": "@whimmy-ai/openclaw-channel",
       "localPath": ".",
       "defaultChoice": "npm"
     }

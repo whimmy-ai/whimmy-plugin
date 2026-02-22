@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
-import { whimmyPlugin } from './src/channel';
+import { whimmyPlugin, registerWhimmyHooks } from './src/channel';
 import { setWhimmyRuntime } from './src/runtime';
+import { registerWhimmyCli } from './src/setup';
 
 const plugin = {
   id: 'whimmy',
@@ -10,6 +11,8 @@ const plugin = {
   register(api: OpenClawPluginApi): void {
     setWhimmyRuntime(api.runtime);
     api.registerChannel({ plugin: whimmyPlugin });
+    registerWhimmyCli(api);
+    registerWhimmyHooks(api);
   },
 };
 
