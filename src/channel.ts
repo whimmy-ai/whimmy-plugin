@@ -31,6 +31,27 @@ import type {
   AgentInfo,
 } from './types';
 
+// ============ Exec Approval Manager Singleton ============
+
+/**
+ * Minimal interface matching ExecApprovalManager.resolve().
+ * The full class isn't exported from openclaw/plugin-sdk's barrel,
+ * so we type just the method we need.
+ */
+interface ApprovalManagerLike {
+  resolve(recordId: string, decision: 'allow-once' | 'allow-always' | 'deny', resolvedBy?: string | null): boolean;
+}
+
+let approvalManager: ApprovalManagerLike | null = null;
+
+export function setApprovalManager(manager: ApprovalManagerLike): void {
+  approvalManager = manager;
+}
+
+export function getApprovalManager(): ApprovalManagerLike | null {
+  return approvalManager;
+}
+
 // ============ Config Helpers ============
 
 function getConfig(cfg: OpenClawConfig, accountId?: string): WhimmyConfig {
@@ -264,14 +285,22 @@ async function handleHookApproval(
   request: HookApprovalRequest,
   log?: Logger,
 ): Promise<void> {
-  const rt = getWhimmyRuntime();
-
   log?.info?.(`[Whimmy] Approval: execution=${request.executionId} approved=${request.approved}`);
 
-  // TODO: Route approval resolution back into OpenClaw's execution engine.
-  // This depends on how OpenClaw exposes approval resolution to channel plugins.
-  // For now, log it — the exact API will depend on the OpenClaw SDK version.
-  log?.debug?.(`[Whimmy] Approval resolution for ${request.executionId}: approved=${request.approved}, reason=${request.reason}`);
+  const manager = getApprovalManager();
+  if (!manager) {
+    log?.warn?.(`[Whimmy] ExecApprovalManager not yet captured — cannot resolve execution ${request.executionId}`);
+    return;
+  }
+
+  const decision = request.approved ? 'allow-once' as const : 'deny' as const;
+  const resolved = manager.resolve(request.executionId, decision, 'whimmy');
+
+  if (resolved) {
+    log?.info?.(`[Whimmy] Resolved execution ${request.executionId} → ${decision}`);
+  } else {
+    log?.warn?.(`[Whimmy] Failed to resolve execution ${request.executionId} (expired or unknown)`);
+  }
 }
 
 // ============ Inbound Event Handlers ============
@@ -298,6 +327,11 @@ function broadcastEvent(event: string, payload: unknown): void {
   for (const { ws } of activeConnections.values()) {
     sendEvent(ws, event, payload);
   }
+}
+
+/** Forward an exec.approval.requested event to all connected Whimmy backends. */
+export function broadcastApprovalRequest(payload: ExecApprovalRequestedPayload): void {
+  broadcastEvent('exec.approval.requested', payload);
 }
 
 // ============ Actions ============
