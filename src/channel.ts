@@ -143,13 +143,11 @@ async function handleHookAgent(
   sendEvent(ws, 'chat.presence', presenceTyping);
 
   // Dispatch to OpenClaw agent and stream responses back.
-  let dispatchResult: { queuedFinal: boolean; counts: Record<string, number> } | null = null;
+  let lastPartialText = '';
 
   try {
-    dispatchResult = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx,
-      cfg,
-      dispatcherOptions: {
+    const { dispatcher, replyOptions, markDispatchIdle } =
+      rt.channel.reply.createReplyDispatcherWithTyping({
         responsePrefix: '',
         deliver: async (payload: any) => {
           // Handle media attachments.
@@ -166,15 +164,32 @@ async function handleHookAgent(
             };
             sendEvent(ws, 'chat.media', media);
           }
+        },
+        onIdle: () => {
+          markDispatchIdle();
+        },
+      });
 
-          // Handle text content.
-          const text = (payload.markdown || payload.text || '').trimEnd();
-          if (!text) return;
+    await rt.channel.reply.dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyOptions: {
+        ...replyOptions,
+        onPartialReply: (payload: any) => {
+          const text = (payload.text || '').trimEnd();
+          if (!text || text === lastPartialText) return;
+
+          // Send only the new incremental content.
+          const newContent = text.slice(lastPartialText.length);
+          lastPartialText = text;
+
+          if (!newContent) return;
 
           const chunk: ChatChunkPayload = {
             sessionKey: request.sessionKey,
             agentId: request.agentId,
-            content: text,
+            content: newContent,
             done: false,
           };
           sendEvent(ws, 'chat.chunk', chunk);
@@ -441,7 +456,7 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
     threads: false,
     media: true,
     nativeCommands: false,
-    blockStreaming: true,
+    blockStreaming: false,
   },
   reload: { configPrefixes: ['channels.whimmy'] },
   config: {
