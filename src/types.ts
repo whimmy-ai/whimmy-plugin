@@ -61,6 +61,22 @@ export interface HookAttachment {
   sizeBytes: number;
 }
 
+/** HistoryMessage represents a message in the conversation history. */
+export interface HistoryMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  agentName?: string;
+  agentId?: string;
+}
+
+/** AgentInfo describes an agent available for orchestrator delegation. */
+export interface AgentInfo {
+  id: string;
+  name: string;
+  description: string;
+  emoji?: string;
+}
+
 /** HookAgentRequest — backend sends this when a user sends a message. */
 export interface HookAgentRequest {
   message: string;
@@ -69,6 +85,26 @@ export interface HookAgentRequest {
   channel: string;
   agentConfig: AgentConfig;
   attachments?: HookAttachment[];
+  history?: HistoryMessage[];
+  availableAgents?: AgentInfo[];
+  isOrchestrator?: boolean;
+}
+
+/** AgentToolCallPayload — sent by plugin when orchestrator calls ask_agent. */
+export interface AgentToolCallPayload {
+  sessionKey: string;
+  agentId: string;
+  targetAgentId: string;
+  prompt: string;
+  callId: string;
+}
+
+/** ToolResultPayload — sent by backend with the sub-agent's response. */
+export interface ToolResultPayload {
+  sessionKey: string;
+  callId: string;
+  content: string;
+  agentName: string;
 }
 
 /** HookApprovalRequest — backend sends this when a user approves/rejects. */
