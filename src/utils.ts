@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 import type { ConnectionInfo, WhimmyConfig, Logger } from './types';
 
 const DEFAULT_HOST = 'api.whimmy.ai';
@@ -175,4 +177,46 @@ export async function retryWithBackoff<T>(
   }
 
   throw new Error('Retry exhausted');
+}
+
+/**
+ * Upload a local file to the Whimmy backend.
+ * Returns the uploaded file's public URL.
+ */
+export async function uploadFile(
+  filePath: string,
+  conn: ConnectionInfo,
+): Promise<{ url: string; fileName: string; mimeType: string }> {
+  const protocol = conn.tls ? 'https' : 'http';
+  const url = `${protocol}://${conn.host}/files/upload`;
+
+  const fileBuffer = readFileSync(filePath);
+  const fileName = basename(filePath);
+
+  const form = new FormData();
+  form.append('file', new Blob([fileBuffer]), fileName);
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${conn.token}` },
+    body: form,
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`File upload failed (${resp.status}): ${body}`);
+  }
+
+  const data = await resp.json() as {
+    id: string;
+    url: string;
+    originalName: string;
+    mimeType: string;
+  };
+
+  return {
+    url: data.url,
+    fileName: data.originalName,
+    mimeType: data.mimeType,
+  };
 }

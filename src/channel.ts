@@ -2,7 +2,8 @@ import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import type { OpenClawConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { getWhimmyRuntime } from './runtime';
-import { resolveConnection, resolveConnectionAsync, buildWsUrl, isConfigured as isConfiguredUtil } from './utils';
+import { resolveConnection, resolveConnectionAsync, buildWsUrl, isConfigured as isConfiguredUtil, uploadFile } from './utils';
+import { ensureWhimmyAgent } from './sync';
 import type {
   WhimmyConfig,
   WhimmyChannelPlugin,
@@ -126,15 +127,14 @@ async function handleHookAgent(
 
   log?.info?.(`[Whimmy] Inbound: agent=${request.agentId} session=${request.sessionKey} text="${request.message.slice(0, 80)}..."`);
 
-  // Route to the correct OpenClaw agent.
-  const route = rt.channel.routing.resolveAgentRoute({
-    cfg,
-    channel: 'whimmy',
-    accountId,
-    peer: { kind: 'direct', id: request.sessionKey },
-  });
+  // Sync Whimmy agent config into OpenClaw (model + system prompt).
+  const syncedCfg = await ensureWhimmyAgent(request.agentId, request.agentConfig, log);
 
-  const storePath = rt.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
+  // Construct session key directly — no need for resolveAgentRoute.
+  const agentId = request.agentId;
+  const sessionKey = `agent:${agentId}:direct:${request.sessionKey}`.toLowerCase();
+  const mainSessionKey = `agent:${agentId}:main`.toLowerCase();
+  const storePath = rt.channel.session.resolveStorePath(syncedCfg.session?.store, { agentId });
 
   // Build media fields from attachments (following MS Teams / BlueBubbles pattern).
   const attachments = request.attachments ?? [];
@@ -159,7 +159,7 @@ async function handleHookAgent(
     CommandBody: request.message,
     From: request.sessionKey,
     To: request.sessionKey,
-    SessionKey: request.sessionKey,
+    SessionKey: sessionKey,
     AccountId: accountId,
     ChatType: 'direct',
     ConversationLabel: `Whimmy ${request.agentId}`,
@@ -185,10 +185,10 @@ async function handleHookAgent(
   // Record session.
   await rt.channel.session.recordInboundSession({
     storePath,
-    sessionKey: ctx.SessionKey || route.sessionKey,
+    sessionKey: ctx.SessionKey || sessionKey,
     ctx,
     updateLastRoute: {
-      sessionKey: route.mainSessionKey,
+      sessionKey: mainSessionKey,
       channel: 'whimmy',
       to: request.sessionKey,
       accountId,
@@ -216,13 +216,27 @@ async function handleHookAgent(
         deliver: async (payload: any) => {
           // Handle media attachments.
           const urls: string[] = payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
-          for (const url of urls) {
-            const fileName = url.split('/').pop()?.split('?')[0] || 'file';
+          const connInfo = activeConnections.get(accountId)?.conn;
+          for (let url of urls) {
+            let fileName = url.split('/').pop()?.split('?')[0] || 'file';
+            let mimeType = payload.mimeType || 'application/octet-stream';
+            // Upload local files to the backend first.
+            if (connInfo && url.startsWith('/')) {
+              try {
+                const uploaded = await uploadFile(url, connInfo);
+                url = uploaded.url;
+                fileName = uploaded.fileName;
+                mimeType = uploaded.mimeType;
+              } catch (err: any) {
+                log?.error?.(`[Whimmy] Failed to upload file ${url}: ${err.message}`);
+                continue;
+              }
+            }
             const media: ChatMediaPayload = {
               sessionKey: request.sessionKey,
               agentId: request.agentId,
               mediaUrl: url,
-              mimeType: payload.mimeType || 'application/octet-stream',
+              mimeType,
               fileName,
               audioAsVoice: payload.audioAsVoice ?? false,
             };
@@ -236,7 +250,7 @@ async function handleHookAgent(
 
     await rt.channel.reply.dispatchReplyFromConfig({
       ctx,
-      cfg,
+      cfg: syncedCfg,
       dispatcher,
       replyOptions: {
         ...replyOptions,
@@ -357,7 +371,7 @@ function createWhimmyActions(ws: WebSocket, sessionKey: string, agentId: string)
 
 // Track active connections per account to prevent duplicate connections
 // when the framework retries startAccount.
-const activeConnections = new Map<string, { ws: WebSocket; stopFn: () => void }>();
+const activeConnections = new Map<string, { ws: WebSocket; conn: ConnectionInfo; stopFn: () => void }>();
 
 async function connectWebSocket(
   conn: ConnectionInfo,
@@ -504,7 +518,7 @@ async function connectWebSocket(
     log?.info?.(`[Whimmy][${accountId}] Stopped`);
   };
 
-  const result = { ws, stopFn };
+  const result = { ws, conn, stopFn };
   activeConnections.set(accountId, result);
   return result;
 }
@@ -599,6 +613,18 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
       const actions = createWhimmyActions(conn.ws, sessionKey, agentId);
 
       switch (action) {
+        case 'send': {
+          const text = typeof params.text === 'string' ? params.text : '';
+          if (!text) return { ok: false, error: 'Missing text' };
+          const chunk: ChatChunkPayload = {
+            sessionKey,
+            agentId,
+            content: text,
+            done: true,
+          };
+          sendEvent(conn.ws, 'chat.done', chunk);
+          return { ok: true };
+        }
         case 'react': {
           const messageId = typeof params.messageId === 'string' ? params.messageId : '';
           const emoji = typeof params.emoji === 'string' ? params.emoji : '';
@@ -620,18 +646,46 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
           return { ok: true };
         }
         case 'sendAttachment': {
-          const mediaUrl = typeof params.mediaUrl === 'string' ? params.mediaUrl : '';
-          if (!mediaUrl) return { ok: false, error: 'Missing mediaUrl' };
-          const fileName = typeof params.fileName === 'string' ? params.fileName : mediaUrl.split('/').pop()?.split('?')[0] || 'file';
+          let mediaUrl = typeof params.mediaUrl === 'string' ? params.mediaUrl : '';
+          let fileName = typeof params.fileName === 'string' ? params.fileName : '';
+          let mimeType = typeof params.mimeType === 'string' ? params.mimeType : '';
+          const filePath = typeof params.filePath === 'string' ? params.filePath : '';
+
+          // If a local file path is provided, upload it to the backend first.
+          if (filePath && !mediaUrl) {
+            try {
+              const uploaded = await uploadFile(filePath, conn.conn);
+              mediaUrl = uploaded.url;
+              if (!fileName) fileName = uploaded.fileName;
+              if (!mimeType) mimeType = uploaded.mimeType;
+            } catch (uploadErr: any) {
+              return { ok: false, error: `File upload failed: ${uploadErr.message}` };
+            }
+          }
+
+          if (!mediaUrl) return { ok: false, error: 'Missing mediaUrl or filePath' };
+          if (!fileName) fileName = mediaUrl.split('/').pop()?.split('?')[0] || 'file';
+          if (!mimeType) mimeType = 'application/octet-stream';
+
           const media: ChatMediaPayload = {
             sessionKey,
             agentId,
             mediaUrl,
-            mimeType: typeof params.mimeType === 'string' ? params.mimeType : 'application/octet-stream',
+            mimeType,
             fileName,
             audioAsVoice: params.audioAsVoice === true,
           };
           sendEvent(conn.ws, 'chat.media', media);
+          // Send caption as a follow-up text message if provided.
+          if (typeof params.caption === 'string' && params.caption) {
+            const caption: ChatChunkPayload = {
+              sessionKey,
+              agentId,
+              content: params.caption,
+              done: true,
+            };
+            sendEvent(conn.ws, 'chat.done', caption);
+          }
           return { ok: true };
         }
         default:
@@ -648,9 +702,19 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
       return { ok: true as const, to: to.trim() };
     },
     sendText: async ({ cfg, to, text, accountId, log }: any) => {
-      // Outbound from OpenClaw CLI → send as chat.done through the WS.
-      // This is handled by the gateway connection, not a standalone HTTP call.
-      // For now, log it. The gateway dispatchReply handles the normal flow.
+      const id = accountId ?? 'default';
+      const conn = activeConnections.get(id);
+      if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
+        log?.warn?.(`[Whimmy] sendText: not connected (account=${id})`);
+        return { channel: 'whimmy', messageId: randomUUID() };
+      }
+      const chunk: ChatChunkPayload = {
+        sessionKey: to,
+        agentId: 'default',
+        content: text,
+        done: true,
+      };
+      sendEvent(conn.ws, 'chat.done', chunk);
       log?.debug?.(`[Whimmy] sendText: to=${to} text=${text.slice(0, 80)}`);
       return {
         channel: 'whimmy',
