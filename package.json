@@ -1,6 +1,6 @@
 {
   "name": "@whimmy-ai/whimmy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Whimmy channel plugin for OpenClaw",
   "main": "index.ts",
   "type": "module",
