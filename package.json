@@ -18,6 +18,10 @@
     "channel"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whimmy-ai/openclaw-channel"
+  },
   "dependencies": {
     "@clack/prompts": "^1.0.1",
     "chalk": "^5.6.2",
