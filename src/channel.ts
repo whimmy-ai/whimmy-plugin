@@ -25,6 +25,10 @@ import type {
   GatewayStopResult,
   Logger,
   ConnectionInfo,
+  AgentToolCallPayload,
+  ToolResultPayload,
+  HistoryMessage,
+  AgentInfo,
 } from './types';
 
 // ============ Config Helpers ============
@@ -59,6 +63,35 @@ function sendEvent(ws: WebSocket, event: string, payload: unknown): boolean {
   return sendEnvelope(ws, { type: 'event', payload: webhookEvent });
 }
 
+// ============ Tool Result Waiters (Orchestrator Mode) ============
+
+/** Pending tool call results: callId → resolve function */
+const toolResultWaiters = new Map<string, (result: ToolResultPayload) => void>();
+
+// ============ History Formatting ============
+
+function formatHistoryForAgent(history: HistoryMessage[]): string {
+  if (!history || history.length === 0) return '';
+  const lines = history.map(m => {
+    if (m.role === 'user') return `User: ${m.content}`;
+    const name = m.agentName || 'Assistant';
+    return `Assistant (${name}): ${m.content}`;
+  });
+  return `[Conversation History]\n${lines.join('\n')}\n[Current Message]\n`;
+}
+
+function buildOrchestratorSystemPromptSuffix(agents: AgentInfo[]): string {
+  const agentList = agents.map(a => {
+    const emoji = a.emoji ? `${a.emoji} ` : '';
+    return `- ${emoji}${a.name} (id: ${a.id}): ${a.description}`;
+  }).join('\n');
+
+  return `\n\nYou are the orchestrator agent. You coordinate a team of specialist agents.\n` +
+    `Available agents:\n${agentList}\n\n` +
+    `To delegate a task to an agent, use the \`ask_agent\` tool with the agent's id and a prompt.\n` +
+    `Synthesize the specialists' responses into a coherent final answer for the user.`;
+}
+
 // ============ Message Handler ============
 
 async function handleHookAgent(
@@ -88,9 +121,19 @@ async function handleHookAgent(
   const mediaUrls = attachments.map(a => a.fileUrl || a.filePath);
   const mediaTypes = attachments.map(a => a.mimeType);
 
+  // Prepend conversation history to the message body if provided.
+  const historyPrefix = formatHistoryForAgent(request.history ?? []);
+  const bodyForAgent = historyPrefix ? `${historyPrefix}${request.message}` : request.message;
+
+  // Append orchestrator instructions to system prompt if this is the orchestrator.
+  if (request.isOrchestrator && request.availableAgents && request.availableAgents.length > 0) {
+    const suffix = buildOrchestratorSystemPromptSuffix(request.availableAgents);
+    request.agentConfig.systemPrompt = (request.agentConfig.systemPrompt || '') + suffix;
+  }
+
   const ctx = rt.channel.reply.finalizeInboundContext({
     Body: request.message,
-    BodyForAgent: request.message,
+    BodyForAgent: bodyForAgent,
     RawBody: request.message,
     CommandBody: request.message,
     From: request.sessionKey,
@@ -368,6 +411,17 @@ async function connectWebSocket(
       case 'hook.read': {
         const request = env.payload as HookReadRequest;
         handleHookRead(request, log);
+        break;
+      }
+      case 'tool.result': {
+        const result = env.payload as ToolResultPayload;
+        const waiter = toolResultWaiters.get(result.callId);
+        if (waiter) {
+          waiter(result);
+          toolResultWaiters.delete(result.callId);
+        } else {
+          log?.debug?.(`[Whimmy][${accountId}] No waiter for tool.result callId=${result.callId}`);
+        }
         break;
       }
       case 'ping': {
