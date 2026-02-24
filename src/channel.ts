@@ -45,6 +45,11 @@ import type {
 /** Stores the latest AgentConfig per agentId so hooks can read it. */
 const agentConfigCache = new Map<string, AgentConfig>();
 
+/** Get the cached agent config for a given agentId. */
+export function getAgentConfig(agentId: string): AgentConfig | undefined {
+  return agentConfigCache.get(agentId);
+}
+
 // ============ Config Helpers ============
 
 function getConfig(cfg: OpenClawConfig, accountId?: string): WhimmyConfig {
@@ -134,6 +139,35 @@ function buildOrchestratorSystemPromptSuffix(agents: AgentInfo[]): string {
     `Synthesize the specialists' responses into a coherent final answer for the user.`;
 }
 
+function buildAskUserQuestionSuffix(): string {
+  return `\n\n## AskUserQuestion Tool
+
+You have access to the \`AskUserQuestion\` tool. Use it when you need the user to make a choice or confirm something before proceeding. The user will see a structured questionnaire in the app.
+
+Call it with a JSON object containing a \`questions\` array:
+\`\`\`json
+{
+  "questions": [
+    {
+      "question": "What kind of project are you building?",
+      "header": "Project Type",
+      "options": [
+        { "label": "Web App", "description": "A browser-based application" },
+        { "label": "CLI Tool", "description": "A command-line utility" },
+        { "label": "API Service", "description": "A backend REST/GraphQL service" }
+      ],
+      "multiSelect": false
+    }
+  ]
+}
+\`\`\`
+
+Guidelines:
+- Use this for decisions with clear, discrete options (not open-ended questions)
+- Keep options concise — 2-6 options per question is ideal
+- Set \`multiSelect: true\` only when multiple selections make sense`;
+}
+
 // ============ Message Handler ============
 
 async function handleHookAgent(
@@ -173,6 +207,12 @@ async function handleHookAgent(
   if (request.isOrchestrator && request.availableAgents && request.availableAgents.length > 0) {
     const suffix = buildOrchestratorSystemPromptSuffix(request.availableAgents);
     request.agentConfig.systemPrompt = (request.agentConfig.systemPrompt || '') + suffix;
+  }
+
+  // Append AskUserQuestion tool instructions if enabled.
+  if (request.agentConfig.askUserQuestion?.enabled !== false) {
+    request.agentConfig.systemPrompt = (request.agentConfig.systemPrompt || '') +
+      buildAskUserQuestionSuffix();
   }
 
   const ctx = rt.channel.reply.finalizeInboundContext({
@@ -887,6 +927,65 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
         messageId: randomUUID(),
       };
     },
+    sendMedia: async ({ to, accountId, log, mediaUrl, filePath, fileName, mimeType, caption, audioAsVoice }: any) => {
+      const id = accountId ?? 'default';
+      const conn = activeConnections.get(id);
+      if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
+        log?.warn?.(`[Whimmy] sendMedia: not connected (account=${id})`);
+        return { channel: 'whimmy', messageId: randomUUID() };
+      }
+
+      let url = mediaUrl || '';
+      let name = fileName || '';
+      let mime = mimeType || '';
+
+      // Upload local file if a path is provided.
+      if (filePath && !url) {
+        try {
+          const uploaded = await uploadFile(filePath, conn.conn);
+          url = uploaded.url;
+          if (!name) name = uploaded.fileName;
+          if (!mime) mime = uploaded.mimeType;
+        } catch (err: any) {
+          log?.error?.(`[Whimmy] sendMedia: upload failed: ${err.message}`);
+          return { channel: 'whimmy', messageId: randomUUID() };
+        }
+      }
+
+      if (!url) {
+        log?.warn?.('[Whimmy] sendMedia: no mediaUrl or filePath provided');
+        return { channel: 'whimmy', messageId: randomUUID() };
+      }
+      if (!name) name = url.split('/').pop()?.split('?')[0] || 'file';
+      if (!mime) mime = 'application/octet-stream';
+
+      const media: ChatMediaPayload = {
+        sessionKey: to,
+        agentId: 'default',
+        mediaUrl: url,
+        mimeType: mime,
+        fileName: name,
+        audioAsVoice: audioAsVoice === true,
+      };
+      sendEvent(conn.ws, 'chat.media', media);
+      log?.debug?.(`[Whimmy] sendMedia: to=${to} file=${name}`);
+
+      // Send caption as a follow-up text message if provided.
+      if (typeof caption === 'string' && caption) {
+        const chunk: ChatChunkPayload = {
+          sessionKey: to,
+          agentId: 'default',
+          content: caption,
+          done: true,
+        };
+        sendEvent(conn.ws, 'chat.done', chunk);
+      }
+
+      return {
+        channel: 'whimmy',
+        messageId: randomUUID(),
+      };
+    },
   },
   gateway: {
     startAccount: async (ctx: GatewayStartContext): Promise<GatewayStopResult> => {
@@ -1018,6 +1117,7 @@ function toolMatchesApprovalList(toolName: string, toolList: string[]): boolean 
  */
 export function registerWhimmyHooks(api: OpenClawPluginApi): void {
   api.on('before_tool_call', async (event, ctx) => {
+    api.logger?.debug?.(`[Whimmy] before_tool_call: tool=${event.toolName}`);
     if (!ctx.sessionKey) return;
 
     // Intercept AskUserQuestion: forward to Whimmy UI and wait for answer.

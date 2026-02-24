@@ -104,6 +104,18 @@ export async function ensureWhimmyAgent(
     log?.info?.(`[Whimmy] Set exec ask=off for ${agentId} (Whimmy is sole approval surface)`);
   }
 
+  // Ensure plugin tools (like AskUserQuestion) are available to this agent.
+  if (agentConfig.askUserQuestion?.enabled !== false) {
+    const existingAllow: string[] = (entry as any).tools?.allow ?? [];
+    if (!existingAllow.includes('AskUserQuestion') && !existingAllow.includes('group:plugins')) {
+      (entry as any).tools = {
+        ...((entry as any).tools ?? {}),
+        allow: [...existingAllow, 'AskUserQuestion'],
+      };
+      log?.info?.(`[Whimmy] Added AskUserQuestion to tools.allow for ${agentId}`);
+    }
+  }
+
   // Resolve workspace dir and write SOUL.md.
   const workspace = cfg.agents?.defaults?.workspace
     ?? join(homedir(), '.openclaw', 'workspace');
