@@ -938,7 +938,9 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
         messageId: randomUUID(),
       };
     },
-    sendMedia: async ({ to, accountId, log, mediaUrl, filePath, fileName, mimeType, caption, audioAsVoice }: any) => {
+    sendMedia: async (ctx: any) => {
+      const { to, accountId, text, mediaUrl } = ctx;
+      const log = ctx.log ?? ctx.deps?.log;
       const id = accountId ?? 'default';
       const conn = activeConnections.get(id);
       if (!conn || conn.ws.readyState !== WebSocket.OPEN) {
@@ -947,46 +949,45 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
       }
 
       let url = mediaUrl || '';
-      let name = fileName || '';
-      let mime = mimeType || '';
+      let fileName = url.split('/').pop()?.split('?')[0] || 'file';
+      let mimeType = 'application/octet-stream';
 
-      // Upload local file if a path is provided.
-      if (filePath && !url) {
+      if (!url) {
+        log?.warn?.('[Whimmy] sendMedia: no mediaUrl provided');
+        return { channel: 'whimmy', messageId: randomUUID() };
+      }
+
+      // Upload local files to the backend first (same pattern as inbound deliver).
+      if (url.startsWith('/')) {
         try {
-          const uploaded = await uploadFile(filePath, conn.conn);
+          const uploaded = await uploadFile(url, conn.conn);
           url = uploaded.url;
-          if (!name) name = uploaded.fileName;
-          if (!mime) mime = uploaded.mimeType;
+          fileName = uploaded.fileName;
+          mimeType = uploaded.mimeType;
+          log?.debug?.(`[Whimmy] sendMedia: uploaded local file → ${url}`);
         } catch (err: any) {
-          log?.error?.(`[Whimmy] sendMedia: upload failed: ${err.message}`);
+          log?.error?.(`[Whimmy] sendMedia: upload failed for ${mediaUrl}: ${err.message}`);
           return { channel: 'whimmy', messageId: randomUUID() };
         }
       }
-
-      if (!url) {
-        log?.warn?.('[Whimmy] sendMedia: no mediaUrl or filePath provided');
-        return { channel: 'whimmy', messageId: randomUUID() };
-      }
-      if (!name) name = url.split('/').pop()?.split('?')[0] || 'file';
-      if (!mime) mime = 'application/octet-stream';
 
       const media: ChatMediaPayload = {
         sessionKey: to,
         agentId: 'default',
         mediaUrl: url,
-        mimeType: mime,
-        fileName: name,
-        audioAsVoice: audioAsVoice === true,
+        mimeType,
+        fileName,
+        audioAsVoice: false,
       };
       sendEvent(conn.ws, 'chat.media', media);
-      log?.debug?.(`[Whimmy] sendMedia: to=${to} file=${name}`);
+      log?.debug?.(`[Whimmy] sendMedia: to=${to} file=${fileName}`);
 
-      // Send caption as a follow-up text message if provided.
-      if (typeof caption === 'string' && caption) {
+      // Framework passes caption as `text`.
+      if (typeof text === 'string' && text.trim()) {
         const chunk: ChatChunkPayload = {
           sessionKey: to,
           agentId: 'default',
-          content: caption,
+          content: text,
           done: true,
         };
         sendEvent(conn.ws, 'chat.done', chunk);
