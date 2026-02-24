@@ -1,9 +1,12 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { OpenClawConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { getWhimmyRuntime } from './runtime';
 import { resolveConnection, resolveConnectionAsync, buildWsUrl, isConfigured as isConfiguredUtil, uploadFile } from './utils';
-import { ensureWhimmyAgent } from './sync';
+import { ensureWhimmyAgent, collectChangedMemoryFiles } from './sync';
 import type {
   WhimmyConfig,
   WhimmyChannelPlugin,
@@ -33,28 +36,14 @@ import type {
   ToolResultPayload,
   HistoryMessage,
   AgentInfo,
+  AgentConfig,
+  AgentMemorySyncPayload,
 } from './types';
 
-// ============ Exec Approval Manager Singleton ============
+// ============ Per-Agent Config Cache ============
 
-/**
- * Minimal interface matching ExecApprovalManager.resolve().
- * The full class isn't exported from openclaw/plugin-sdk's barrel,
- * so we type just the method we need.
- */
-interface ApprovalManagerLike {
-  resolve(recordId: string, decision: 'allow-once' | 'allow-always' | 'deny', resolvedBy?: string | null): boolean;
-}
-
-let approvalManager: ApprovalManagerLike | null = null;
-
-export function setApprovalManager(manager: ApprovalManagerLike): void {
-  approvalManager = manager;
-}
-
-export function getApprovalManager(): ApprovalManagerLike | null {
-  return approvalManager;
-}
+/** Stores the latest AgentConfig per agentId so hooks can read it. */
+const agentConfigCache = new Map<string, AgentConfig>();
 
 // ============ Config Helpers ============
 
@@ -93,10 +82,33 @@ function sendEvent(ws: WebSocket, event: string, payload: unknown): boolean {
 /** Pending tool call results: callId → resolve function */
 const toolResultWaiters = new Map<string, (result: ToolResultPayload) => void>();
 
+// ============ Approval Waiters ============
+
+/** Pending approval decisions: executionId → resolve function */
+const approvalWaiters = new Map<string, (approved: boolean) => void>();
+
+/** Session-level approval memory: agentId → Set of already-approved tool names */
+const sessionApprovals = new Map<string, Set<string>>();
+
 // ============ AskUserQuestion Waiters ============
 
 /** Pending user question answers: questionId → resolve function */
 const askUserQuestionWaiters = new Map<string, (answers: Record<string, string>) => void>();
+
+// ============ Model Context Limits ============
+
+/** Resolve the max context window size for a given model identifier. */
+function resolveMaxContextTokens(model: string): number {
+  const m = model.toLowerCase();
+  if (m.includes('opus')) return 200_000;
+  if (m.includes('haiku')) return 200_000;
+  if (m.includes('sonnet')) return 200_000;
+  if (m.includes('gpt-4o')) return 128_000;
+  if (m.includes('gpt-4')) return 128_000;
+  if (m.includes('o1') || m.includes('o3') || m.includes('o4')) return 200_000;
+  // Default fallback.
+  return 200_000;
+}
 
 // ============ History Formatting ============
 
@@ -134,6 +146,9 @@ async function handleHookAgent(
   const rt = getWhimmyRuntime();
 
   log?.info?.(`[Whimmy] Inbound: agent=${request.agentId} session=${request.sessionKey} text="${request.message.slice(0, 80)}..."`);
+
+  // Cache agent config so hooks can read it later.
+  agentConfigCache.set(request.agentId, request.agentConfig);
 
   // Sync Whimmy agent config into OpenClaw (model + system prompt).
   const syncedCfg = await ensureWhimmyAgent(request.agentId, request.agentConfig, log);
@@ -286,6 +301,27 @@ async function handleHookAgent(
     log?.error?.(`[Whimmy] dispatch error: ${dispatchErr.message}`);
   }
 
+  // Sync changed memory files back to the backend (non-fatal).
+  try {
+    const workspace = syncedCfg.agents?.defaults?.workspace
+      ?? join(homedir(), '.openclaw', 'workspace');
+    const agentDir = join(workspace, 'agents', request.agentId);
+    const changedFiles = collectChangedMemoryFiles(request.agentId, agentDir, log);
+
+    if (changedFiles) {
+      const memoryPayload: AgentMemorySyncPayload = {
+        sessionKey: request.sessionKey,
+        agentId: request.agentId,
+        files: changedFiles,
+      };
+      sendEvent(ws, 'agent.memory_sync', memoryPayload);
+      const fileNames = Object.keys(changedFiles).join(', ');
+      log?.info?.(`[Whimmy] Sent memory sync for ${request.agentId}: ${fileNames}`);
+    }
+  } catch (memErr: any) {
+    log?.debug?.(`[Whimmy] Memory sync failed (non-fatal): ${memErr.message}`);
+  }
+
   // Clear typing indicator and send chat.done.
   const presenceIdle: ChatPresencePayload = {
     sessionKey: request.sessionKey,
@@ -294,11 +330,45 @@ async function handleHookAgent(
   };
   sendEvent(ws, 'chat.presence', presenceIdle);
 
+  // Read token usage and context info from session store.
+  let tokenCount: number | undefined;
+  let cost: number | undefined;
+  let context: ChatChunkPayload['context'];
+  try {
+    const raw = readFileSync(storePath, 'utf-8');
+    const store = JSON.parse(raw) as Record<string, {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      contextTokens?: number;
+      model?: string;
+    }>;
+    const entry = store[sessionKey] ?? store[mainSessionKey];
+    if (entry) {
+      const total = entry.totalTokens ?? ((entry.inputTokens ?? 0) + (entry.outputTokens ?? 0));
+      tokenCount = total > 0 ? total : undefined;
+
+      if (entry.contextTokens && entry.contextTokens > 0) {
+        const maxContext = resolveMaxContextTokens(entry.model ?? request.agentConfig.model);
+        context = {
+          used: entry.contextTokens,
+          max: maxContext,
+          percent: Math.round((entry.contextTokens / maxContext) * 100),
+        };
+      }
+    }
+  } catch {
+    // Session store may not exist yet on first message — ignore.
+  }
+
   const done: ChatChunkPayload = {
     sessionKey: request.sessionKey,
     agentId: request.agentId,
     content: '',
     done: true,
+    tokenCount,
+    cost,
+    context,
   };
   sendEvent(ws, 'chat.done', done);
 }
@@ -309,19 +379,13 @@ async function handleHookApproval(
 ): Promise<void> {
   log?.info?.(`[Whimmy] Approval: execution=${request.executionId} approved=${request.approved}`);
 
-  const manager = getApprovalManager();
-  if (!manager) {
-    log?.warn?.(`[Whimmy] ExecApprovalManager not yet captured — cannot resolve execution ${request.executionId}`);
-    return;
-  }
-
-  const decision = request.approved ? 'allow-once' as const : 'deny' as const;
-  const resolved = manager.resolve(request.executionId, decision, 'whimmy');
-
-  if (resolved) {
-    log?.info?.(`[Whimmy] Resolved execution ${request.executionId} → ${decision}`);
+  const waiter = approvalWaiters.get(request.executionId);
+  if (waiter) {
+    approvalWaiters.delete(request.executionId);
+    waiter(request.approved);
+    log?.info?.(`[Whimmy] Resolved approval waiter ${request.executionId} → ${request.approved}`);
   } else {
-    log?.warn?.(`[Whimmy] Failed to resolve execution ${request.executionId} (expired or unknown)`);
+    log?.warn?.(`[Whimmy] No waiter for approval ${request.executionId} (expired or unknown)`);
   }
 }
 
@@ -354,6 +418,41 @@ function broadcastEvent(event: string, payload: unknown): void {
 /** Forward an exec.approval.requested event to all connected Whimmy backends. */
 export function broadcastApprovalRequest(payload: ExecApprovalRequestedPayload): void {
   broadcastEvent('exec.approval.requested', payload);
+}
+
+/**
+ * Request approval from the user for a tool call.
+ * Sends the request to the app and waits for a response.
+ */
+export function requestApproval(
+  sessionKey: string,
+  agentId: string,
+  toolName: string,
+  params: Record<string, unknown>,
+  timeoutMs = 120_000,
+): Promise<boolean> {
+  const executionId = randomUUID();
+
+  return new Promise<boolean>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      approvalWaiters.delete(executionId);
+      reject(new Error(`Approval timed out after ${timeoutMs}ms (executionId=${executionId})`));
+    }, timeoutMs);
+
+    approvalWaiters.set(executionId, (approved) => {
+      clearTimeout(timer);
+      resolve(approved);
+    });
+
+    broadcastApprovalRequest({
+      sessionKey,
+      agentId,
+      executionId,
+      toolName,
+      action: `${toolName}(${JSON.stringify(params).slice(0, 200)})`,
+      params,
+    });
+  });
 }
 
 /** Forward an ask_user_question event to all connected Whimmy backends. */
@@ -892,6 +991,25 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
   },
 };
 
+// ============ Tool Name Aliases ============
+
+/**
+ * Map framework-internal tool names to user-facing names used in approval config.
+ * The backend sends tools like ["Bash","Write","Edit"], but the framework
+ * fires before_tool_call with internal names like "exec".
+ */
+const TOOL_APPROVAL_ALIASES: Record<string, string> = {
+  exec: 'Bash',
+};
+
+function toolMatchesApprovalList(toolName: string, toolList: string[]): boolean {
+  if (toolList.includes('*')) return true;
+  if (toolList.includes(toolName)) return true;
+  const alias = TOOL_APPROVAL_ALIASES[toolName];
+  if (alias && toolList.includes(alias)) return true;
+  return false;
+}
+
 // ============ Tool Lifecycle Hooks ============
 
 /**
@@ -904,6 +1022,12 @@ export function registerWhimmyHooks(api: OpenClawPluginApi): void {
 
     // Intercept AskUserQuestion: forward to Whimmy UI and wait for answer.
     if (event.toolName === 'AskUserQuestion' || event.toolName === 'ask_user_question') {
+      const agentCfg = agentConfigCache.get(ctx.agentId || 'default');
+      const auqConfig = agentCfg?.askUserQuestion;
+
+      // Skip if explicitly disabled.
+      if (auqConfig?.enabled === false) return;
+
       const questions = (event.params?.questions ?? []) as AskUserQuestion[];
       if (questions.length === 0) return;
 
@@ -912,11 +1036,14 @@ export function registerWhimmyHooks(api: OpenClawPluginApi): void {
       const parts = ctx.sessionKey.split(':');
       const whimmySessionKey = parts.length >= 4 ? parts.slice(3).join(':') : ctx.sessionKey;
 
+      const timeoutMs = auqConfig?.timeoutMs ?? 120_000;
+
       try {
         const answers = await askUserQuestion(
           whimmySessionKey,
           ctx.agentId || 'default',
           questions,
+          timeoutMs,
         );
 
         // Return modified params with the user's answers filled in.
@@ -935,11 +1062,79 @@ export function registerWhimmyHooks(api: OpenClawPluginApi): void {
       }
     }
 
+    // Approval interception: check if this tool requires user approval.
+    const agentId = ctx.agentId || 'default';
+    const agentCfg = agentConfigCache.get(agentId);
+    const approvalCfg = agentCfg?.approvals;
+
+    if (approvalCfg?.enabled) {
+      const toolList = approvalCfg.tools ?? ['*'];
+      const needsApproval = toolMatchesApprovalList(event.toolName, toolList);
+
+      if (needsApproval) {
+        // Session mode: skip if already approved for this tool in this session.
+        if (approvalCfg.mode === 'session') {
+          const approved = sessionApprovals.get(agentId);
+          if (approved?.has(event.toolName)) {
+            // Already approved this session — fall through to lifecycle broadcast.
+          } else {
+            // Need to ask.
+            const parts = ctx.sessionKey.split(':');
+            const whimmySessionKey = parts.length >= 4 ? parts.slice(3).join(':') : ctx.sessionKey;
+            const timeoutMs = approvalCfg.timeoutMs ?? 120_000;
+
+            try {
+              const allowed = await requestApproval(
+                whimmySessionKey,
+                agentId,
+                event.toolName,
+                (event.params ?? {}) as Record<string, unknown>,
+                timeoutMs,
+              );
+
+              if (allowed) {
+                // Remember for session mode.
+                if (!sessionApprovals.has(agentId)) sessionApprovals.set(agentId, new Set());
+                sessionApprovals.get(agentId)!.add(event.toolName);
+              } else {
+                return { block: true, blockReason: `User denied ${event.toolName}` };
+              }
+            } catch (err: any) {
+              api.logger?.warn?.(`[Whimmy] Approval request failed: ${err.message}`);
+              return { block: true, blockReason: `Approval timed out for ${event.toolName}` };
+            }
+          }
+        } else {
+          // 'always' mode: ask every time.
+          const parts = ctx.sessionKey.split(':');
+          const whimmySessionKey = parts.length >= 4 ? parts.slice(3).join(':') : ctx.sessionKey;
+          const timeoutMs = approvalCfg.timeoutMs ?? 120_000;
+
+          try {
+            const allowed = await requestApproval(
+              whimmySessionKey,
+              agentId,
+              event.toolName,
+              (event.params ?? {}) as Record<string, unknown>,
+              timeoutMs,
+            );
+
+            if (!allowed) {
+              return { block: true, blockReason: `User denied ${event.toolName}` };
+            }
+          } catch (err: any) {
+            api.logger?.warn?.(`[Whimmy] Approval request failed: ${err.message}`);
+            return { block: true, blockReason: `Approval timed out for ${event.toolName}` };
+          }
+        }
+      }
+    }
+
     // Default: broadcast tool.start lifecycle event.
     const executionId = randomUUID();
     const payload: ToolLifecyclePayload = {
       sessionKey: ctx.sessionKey,
-      agentId: ctx.agentId || 'default',
+      agentId: agentId,
       executionId,
       toolName: event.toolName,
       status: 'running',

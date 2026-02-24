@@ -54,6 +54,10 @@ export interface AgentConfig {
   skills?: string[];
   /** Global skill entries to sync (enable/disable, API keys, env vars). */
   skillEntries?: Record<string, SkillEntryConfig>;
+  /** Approval settings — controls whether exec commands require user approval via Whimmy. */
+  approvals?: ApprovalConfig;
+  /** AskUserQuestion settings — controls interactive question forwarding to Whimmy. */
+  askUserQuestion?: AskUserQuestionConfig;
 }
 
 /** SkillEntryConfig — per-skill configuration synced from Whimmy. */
@@ -62,6 +66,25 @@ export interface SkillEntryConfig {
   apiKey?: string;
   env?: Record<string, string>;
   config?: Record<string, unknown>;
+}
+
+/** ApprovalConfig — controls tool approval forwarding to Whimmy. */
+export interface ApprovalConfig {
+  /** Enable approval flow. Default: false. */
+  enabled?: boolean;
+  /** 'always' = every matched tool call needs approval, 'session' = approve once per session. */
+  mode?: 'session' | 'always';
+  /** Tool names that require approval. Omit or ['*'] = all tools. */
+  tools?: string[];
+  /** Timeout in ms before auto-denying. Default: 120000 (2 min). */
+  timeoutMs?: number;
+}
+
+/** AskUserQuestionConfig — controls AskUserQuestion interception. */
+export interface AskUserQuestionConfig {
+  enabled?: boolean;
+  /** Timeout in milliseconds before auto-blocking. Default: 120000 (2 min). */
+  timeoutMs?: number;
 }
 
 /** HookAttachment describes a file attached to a user message. */
@@ -141,6 +164,18 @@ export interface ChatChunkPayload {
   messageId?: string;
   tokenCount?: number;
   cost?: number;
+  /** Context window usage stats (only on chat.done). */
+  context?: ContextUsage;
+}
+
+/** ContextUsage — how full the agent's context window is. */
+export interface ContextUsage {
+  /** Current context tokens used. */
+  used: number;
+  /** Max context tokens for the model. */
+  max: number;
+  /** Percentage of context used (0-100). */
+  percent: number;
 }
 
 /** ChatMediaPayload — file or voice message sent back to backend. */
@@ -243,6 +278,21 @@ export interface ExecApprovalRequestedPayload {
   executionId: string;
   toolName: string;
   action: string;
+  /** Tool call parameters — so the app can show what exactly is being requested. */
+  params?: Record<string, unknown>;
+}
+
+/** MemoryFileEntry — a single memory file with content and hash. */
+export interface MemoryFileEntry {
+  content: string;
+  hash: string;
+}
+
+/** AgentMemorySyncPayload — syncs changed memory files to the backend. */
+export interface AgentMemorySyncPayload {
+  sessionKey: string;
+  agentId: string;
+  files: Record<string, MemoryFileEntry>;
 }
 
 /** ToolLifecyclePayload — tool start/done/error sent back to backend. */

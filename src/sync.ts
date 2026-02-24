@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { OpenClawConfig } from 'openclaw/plugin-sdk';
 import { getWhimmyRuntime } from './runtime';
-import type { AgentConfig, Logger } from './types';
+import type { AgentConfig, Logger, MemoryFileEntry } from './types';
 
 /** In-memory cache: agentId → hash of full synced config. */
 const hashCache = new Map<string, string>();
@@ -15,6 +15,8 @@ function computeHash(agentConfig: AgentConfig): string {
     systemPrompt: agentConfig.systemPrompt ?? '',
     skills: agentConfig.skills ?? null,
     skillEntries: agentConfig.skillEntries ?? null,
+    approvals: agentConfig.approvals ?? null,
+    askUserQuestion: agentConfig.askUserQuestion ?? null,
   });
   return createHash('sha256').update(data).digest('hex');
 }
@@ -86,6 +88,22 @@ export async function ensureWhimmyAgent(
     log?.info?.(`[Whimmy] Synced skill entries: [${names.join(', ')}]`);
   }
 
+  // When Whimmy handles approvals, disable framework-level exec prompting
+  // so the two systems don't race. See: ExecApprovalManager / ask modes.
+  if (agentConfig.approvals?.enabled) {
+    const tools = agentConfig.approvals.tools ?? ['*'];
+    log?.info?.(`[Whimmy] Approvals enabled: mode=${agentConfig.approvals.mode ?? 'always'} tools=[${tools.join(', ')}]`);
+
+    (entry as any).tools = {
+      ...((entry as any).tools ?? {}),
+      exec: {
+        ...(((entry as any).tools ?? {}).exec ?? {}),
+        ask: 'off',
+      },
+    };
+    log?.info?.(`[Whimmy] Set exec ask=off for ${agentId} (Whimmy is sole approval surface)`);
+  }
+
   // Resolve workspace dir and write SOUL.md.
   const workspace = cfg.agents?.defaults?.workspace
     ?? join(homedir(), '.openclaw', 'workspace');
@@ -111,4 +129,85 @@ export async function ensureWhimmyAgent(
   log?.info?.(`[Whimmy] Agent ${agentId} synced: model=${agentConfig.model} agentDir=${agentDir}`);
 
   return cfg;
+}
+
+// ============ Memory File Sync ============
+
+/** In-memory hash cache for memory files: "agentId:filename" → SHA256 hash. */
+const memoryHashCache = new Map<string, string>();
+
+/** Top-level memory files to scan (excludes framework files like SOUL.md, BOOTSTRAP.md, AGENTS.md). */
+const MEMORY_FILES = ['USER.md', 'IDENTITY.md', 'TOOLS.md', 'HEARTBEAT.md'];
+
+/** Max number of files from memory/ subdir. */
+const MEMORY_SUBDIR_MAX_FILES = 10;
+
+/** Max total size in bytes for all memory files. */
+const MEMORY_MAX_TOTAL_BYTES = 100 * 1024; // 100KB
+
+/**
+ * Collect memory files that have changed since the last sync.
+ * Returns a record of changed files, or null if nothing changed.
+ */
+export function collectChangedMemoryFiles(
+  agentId: string,
+  agentDir: string,
+  log?: Logger,
+): Record<string, MemoryFileEntry> | null {
+  const changed: Record<string, MemoryFileEntry> = {};
+  let totalBytes = 0;
+
+  function tryFile(filename: string, filePath: string): void {
+    if (!existsSync(filePath)) return;
+
+    let content: string;
+    try {
+      content = readFileSync(filePath, 'utf-8');
+    } catch {
+      return;
+    }
+
+    if (!content.trim()) return;
+
+    const bytes = Buffer.byteLength(content, 'utf-8');
+    if (totalBytes + bytes > MEMORY_MAX_TOTAL_BYTES) {
+      log?.debug?.(`[Whimmy] Memory sync: skipping ${filename} (would exceed 100KB cap)`);
+      return;
+    }
+
+    const hash = createHash('sha256').update(content).digest('hex');
+    const cacheKey = `${agentId}:${filename}`;
+
+    if (memoryHashCache.get(cacheKey) === hash) return;
+
+    totalBytes += bytes;
+    changed[filename] = { content, hash };
+    memoryHashCache.set(cacheKey, hash);
+  }
+
+  // Scan top-level memory files.
+  for (const filename of MEMORY_FILES) {
+    tryFile(filename, join(agentDir, filename));
+  }
+
+  // Scan memory/ subdir for *.md files.
+  const memoryDir = join(agentDir, 'memory');
+  if (existsSync(memoryDir)) {
+    try {
+      const entries = readdirSync(memoryDir)
+        .filter(f => f.endsWith('.md'))
+        .slice(0, MEMORY_SUBDIR_MAX_FILES);
+
+      for (const entry of entries) {
+        const filename = `memory/${entry}`;
+        tryFile(filename, join(memoryDir, entry));
+      }
+    } catch {
+      // memory/ dir may not be readable — ignore.
+    }
+  }
+
+  if (Object.keys(changed).length === 0) return null;
+
+  return changed;
 }
