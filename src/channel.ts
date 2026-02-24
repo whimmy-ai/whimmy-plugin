@@ -766,6 +766,17 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
     nativeCommands: false,
     blockStreaming: false,
   },
+  messaging: {
+    targetResolver: {
+      looksLikeId: (raw: string) => {
+        // Whimmy session keys are 32-char hex strings, optionally followed by "-agentId".
+        // Accept anything that starts with a 32+ char hex prefix.
+        const trimmed = raw.trim();
+        return /^[0-9a-f]{32}/i.test(trimmed);
+      },
+      hint: 'Use the session key shown in the Whimmy app (32-char hex string).',
+    },
+  },
   reload: { configPrefixes: ['channels.whimmy'] },
   config: {
     listAccountIds: (cfg: OpenClawConfig): string[] => {
