@@ -188,7 +188,7 @@ export async function uploadFile(
   conn: ConnectionInfo,
 ): Promise<{ url: string; fileName: string; mimeType: string }> {
   const protocol = conn.tls ? 'https' : 'http';
-  const url = `${protocol}://${conn.host}/api/v1/files/upload`;
+  const url = `${protocol}://${conn.host}/api/v1/providers/files/upload`;
 
   const fileBuffer = readFileSync(filePath);
   const fileName = basename(filePath);
