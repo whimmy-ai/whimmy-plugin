@@ -12,6 +12,7 @@ import type {
   HookApprovalRequest,
   HookReactRequest,
   HookReadRequest,
+  HookAskUserAnswerRequest,
   ChatChunkPayload,
   ChatMediaPayload,
   ChatPresencePayload,
@@ -20,6 +21,8 @@ import type {
   ChatDeletePayload,
   ToolLifecyclePayload,
   ExecApprovalRequestedPayload,
+  AskUserQuestionPayload,
+  AskUserQuestion,
   WebhookEvent,
   ResolvedAccount,
   GatewayStartContext,
@@ -89,6 +92,11 @@ function sendEvent(ws: WebSocket, event: string, payload: unknown): boolean {
 
 /** Pending tool call results: callId → resolve function */
 const toolResultWaiters = new Map<string, (result: ToolResultPayload) => void>();
+
+// ============ AskUserQuestion Waiters ============
+
+/** Pending user question answers: questionId → resolve function */
+const askUserQuestionWaiters = new Map<string, (answers: Record<string, string>) => void>();
 
 // ============ History Formatting ============
 
@@ -348,6 +356,60 @@ export function broadcastApprovalRequest(payload: ExecApprovalRequestedPayload):
   broadcastEvent('exec.approval.requested', payload);
 }
 
+/** Forward an ask_user_question event to all connected Whimmy backends. */
+export function broadcastAskUserQuestion(payload: AskUserQuestionPayload): void {
+  broadcastEvent('ask_user_question', payload);
+}
+
+/**
+ * Send a question to the user and wait for their answer.
+ * Returns the answers map keyed by question text → selected label(s).
+ */
+export function askUserQuestion(
+  sessionKey: string,
+  agentId: string,
+  questions: AskUserQuestion[],
+  timeoutMs = 120_000,
+): Promise<Record<string, string>> {
+  const questionId = randomUUID();
+
+  return new Promise<Record<string, string>>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      askUserQuestionWaiters.delete(questionId);
+      reject(new Error(`AskUserQuestion timed out after ${timeoutMs}ms (questionId=${questionId})`));
+    }, timeoutMs);
+
+    askUserQuestionWaiters.set(questionId, (answers) => {
+      clearTimeout(timer);
+      resolve(answers);
+    });
+
+    const payload: AskUserQuestionPayload = {
+      sessionKey,
+      agentId,
+      questionId,
+      questions,
+    };
+    broadcastAskUserQuestion(payload);
+  });
+}
+
+/** Handle inbound hook.ask_user_answer from the backend. */
+function handleHookAskUserAnswer(
+  request: HookAskUserAnswerRequest,
+  log?: Logger,
+): void {
+  log?.info?.(`[Whimmy] AskUserAnswer: questionId=${request.questionId}`);
+
+  const waiter = askUserQuestionWaiters.get(request.questionId);
+  if (waiter) {
+    waiter(request.answers);
+    askUserQuestionWaiters.delete(request.questionId);
+  } else {
+    log?.warn?.(`[Whimmy] No waiter for ask_user_answer questionId=${request.questionId} (expired or unknown)`);
+  }
+}
+
 // ============ Actions ============
 
 function createWhimmyActions(ws: WebSocket, sessionKey: string, agentId: string) {
@@ -459,6 +521,11 @@ async function connectWebSocket(
       case 'hook.read': {
         const request = env.payload as HookReadRequest;
         handleHookRead(request, log);
+        break;
+      }
+      case 'hook.ask_user_answer': {
+        const request = env.payload as HookAskUserAnswerRequest;
+        handleHookAskUserAnswer(request, log);
         break;
       }
       case 'tool.result': {
@@ -832,8 +899,43 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
  * Called from index.ts during plugin registration.
  */
 export function registerWhimmyHooks(api: OpenClawPluginApi): void {
-  api.on('before_tool_call', (event, ctx) => {
+  api.on('before_tool_call', async (event, ctx) => {
     if (!ctx.sessionKey) return;
+
+    // Intercept AskUserQuestion: forward to Whimmy UI and wait for answer.
+    if (event.toolName === 'AskUserQuestion' || event.toolName === 'ask_user_question') {
+      const questions = (event.params?.questions ?? []) as AskUserQuestion[];
+      if (questions.length === 0) return;
+
+      // Extract sessionKey — strip the "agent:{agentId}:direct:" prefix to get
+      // the original Whimmy session key.
+      const parts = ctx.sessionKey.split(':');
+      const whimmySessionKey = parts.length >= 4 ? parts.slice(3).join(':') : ctx.sessionKey;
+
+      try {
+        const answers = await askUserQuestion(
+          whimmySessionKey,
+          ctx.agentId || 'default',
+          questions,
+        );
+
+        // Return modified params with the user's answers filled in.
+        return {
+          params: {
+            ...event.params,
+            answers,
+          },
+        };
+      } catch (err: any) {
+        api.logger?.warn?.(`[Whimmy] AskUserQuestion failed: ${err.message}`);
+        return {
+          block: true,
+          blockReason: `User did not respond: ${err.message}`,
+        };
+      }
+    }
+
+    // Default: broadcast tool.start lifecycle event.
     const executionId = randomUUID();
     const payload: ToolLifecyclePayload = {
       sessionKey: ctx.sessionKey,
@@ -847,6 +949,9 @@ export function registerWhimmyHooks(api: OpenClawPluginApi): void {
 
   api.on('after_tool_call', (event, ctx) => {
     if (!ctx.sessionKey) return;
+    // Skip lifecycle events for AskUserQuestion — already handled.
+    if (event.toolName === 'AskUserQuestion' || event.toolName === 'ask_user_question') return;
+
     const eventName = event.error ? 'tool.error' : 'tool.done';
     const payload: ToolLifecyclePayload = {
       sessionKey: ctx.sessionKey,

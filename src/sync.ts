@@ -6,21 +6,23 @@ import type { OpenClawConfig } from 'openclaw/plugin-sdk';
 import { getWhimmyRuntime } from './runtime';
 import type { AgentConfig, Logger } from './types';
 
-/** In-memory cache: agentId → hash of { model, systemPrompt }. */
+/** In-memory cache: agentId → hash of full synced config. */
 const hashCache = new Map<string, string>();
 
 function computeHash(agentConfig: AgentConfig): string {
   const data = JSON.stringify({
     model: agentConfig.model,
     systemPrompt: agentConfig.systemPrompt ?? '',
+    skills: agentConfig.skills ?? null,
+    skillEntries: agentConfig.skillEntries ?? null,
   });
   return createHash('sha256').update(data).digest('hex');
 }
 
 /**
  * Ensure the Whimmy agent exists in OpenClaw's config with the correct
- * model and system prompt.  Uses an in-memory hash cache to skip redundant
- * disk writes when nothing changed.
+ * model, system prompt, and skills.  Uses an in-memory hash cache to skip
+ * redundant disk writes when nothing changed.
  */
 export async function ensureWhimmyAgent(
   agentId: string,
@@ -57,6 +59,32 @@ export async function ensureWhimmyAgent(
 
   // Set model.
   entry!.model = agentConfig.model;
+
+  // Set per-agent skill allowlist.
+  if (agentConfig.skills !== undefined) {
+    entry!.skills = agentConfig.skills;
+    log?.info?.(`[Whimmy] Agent ${agentId} skills: [${agentConfig.skills.join(', ')}]`);
+  }
+
+  // Sync global skill entries (enable/disable, API keys, env vars).
+  if (agentConfig.skillEntries && Object.keys(agentConfig.skillEntries).length > 0) {
+    if (!cfg.skills) {
+      (cfg as any).skills = {};
+    }
+    if (!cfg.skills!.entries) {
+      cfg.skills!.entries = {};
+    }
+
+    for (const [skillName, skillConfig] of Object.entries(agentConfig.skillEntries)) {
+      cfg.skills!.entries![skillName] = {
+        ...cfg.skills!.entries![skillName],
+        ...skillConfig,
+      };
+    }
+
+    const names = Object.keys(agentConfig.skillEntries);
+    log?.info?.(`[Whimmy] Synced skill entries: [${names.join(', ')}]`);
+  }
 
   // Resolve workspace dir and write SOUL.md.
   const workspace = cfg.agents?.defaults?.workspace

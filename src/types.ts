@@ -50,6 +50,18 @@ export interface AgentConfig {
   systemPrompt?: string;
   mcpTools?: string[];
   proactivity?: string;
+  /** Per-agent skill allowlist. Omit = all skills; empty array = none. */
+  skills?: string[];
+  /** Global skill entries to sync (enable/disable, API keys, env vars). */
+  skillEntries?: Record<string, SkillEntryConfig>;
+}
+
+/** SkillEntryConfig — per-skill configuration synced from Whimmy. */
+export interface SkillEntryConfig {
+  enabled?: boolean;
+  apiKey?: string;
+  env?: Record<string, string>;
+  config?: Record<string, unknown>;
 }
 
 /** HookAttachment describes a file attached to a user message. */
@@ -191,6 +203,37 @@ export interface HookReadRequest {
   sessionKey: string;
   agentId: string;
   messageId?: string;
+}
+
+// ============ AskUserQuestion Protocol ============
+
+/** Option in a multiple-choice question. */
+export interface AskUserQuestionOption {
+  label: string;
+  description: string;
+  markdown?: string;
+}
+
+/** A single question with options. */
+export interface AskUserQuestion {
+  question: string;
+  header: string;
+  options: AskUserQuestionOption[];
+  multiSelect: boolean;
+}
+
+/** AskUserQuestionPayload — sent to backend when agent needs user input. */
+export interface AskUserQuestionPayload {
+  sessionKey: string;
+  agentId: string;
+  questionId: string;
+  questions: AskUserQuestion[];
+}
+
+/** HookAskUserAnswerRequest — backend sends this with the user's answers. */
+export interface HookAskUserAnswerRequest {
+  questionId: string;
+  answers: Record<string, string>;
 }
 
 /** ExecApprovalRequestedPayload — approval request sent back to backend. */

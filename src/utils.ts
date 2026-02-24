@@ -65,7 +65,7 @@ export async function exchangePairingCode(
   tls: boolean = true,
 ): Promise<ConnectionInfo> {
   const protocol = tls ? 'https' : 'http';
-  const url = `${protocol}://${host}/api/v1/openclaw/pair/redeem`;
+  const url = `${protocol}://${host}/api/v1/providers/pair/redeem`;
 
   const resp = await fetch(url, {
     method: 'POST',
@@ -143,7 +143,7 @@ export async function resolveConnectionAsync(
  */
 export function buildWsUrl(conn: ConnectionInfo): string {
   const protocol = conn.tls ? 'wss' : 'ws';
-  return `${protocol}://${conn.host}/api/v1/openclaw/ws?token=${encodeURIComponent(conn.token)}`;
+  return `${protocol}://${conn.host}/api/v1/providers/ws?token=${encodeURIComponent(conn.token)}`;
 }
 
 /**
@@ -188,7 +188,7 @@ export async function uploadFile(
   conn: ConnectionInfo,
 ): Promise<{ url: string; fileName: string; mimeType: string }> {
   const protocol = conn.tls ? 'https' : 'http';
-  const url = `${protocol}://${conn.host}/files/upload`;
+  const url = `${protocol}://${conn.host}/api/v1/files/upload`;
 
   const fileBuffer = readFileSync(filePath);
   const fileName = basename(filePath);
