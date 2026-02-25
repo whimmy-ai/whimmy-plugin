@@ -100,6 +100,11 @@ const sessionApprovals = new Map<string, Set<string>>();
 /** Pending user question answers: questionId → resolve function */
 const askUserQuestionWaiters = new Map<string, (answers: Record<string, string>) => void>();
 
+// ============ Cumulative Token Tracking ============
+
+/** Tracks the last known cumulative totalTokens per session key so we can compute deltas. */
+const lastCumulativeTokens = new Map<string, number>();
+
 // ============ Model Context Limits ============
 
 /** Resolve the max context window size for a given model identifier. */
@@ -383,10 +388,14 @@ async function handleHookAgent(
       contextTokens?: number;
       model?: string;
     }>;
-    const entry = store[sessionKey] ?? store[mainSessionKey];
+    const storeKey = sessionKey in store ? sessionKey : mainSessionKey;
+    const entry = store[storeKey];
     if (entry) {
-      const total = entry.totalTokens ?? ((entry.inputTokens ?? 0) + (entry.outputTokens ?? 0));
-      tokenCount = total > 0 ? total : undefined;
+      const cumulative = entry.totalTokens ?? ((entry.inputTokens ?? 0) + (entry.outputTokens ?? 0));
+      const prev = lastCumulativeTokens.get(storeKey) ?? 0;
+      const delta = cumulative - prev;
+      if (cumulative > 0) lastCumulativeTokens.set(storeKey, cumulative);
+      tokenCount = delta > 0 ? delta : undefined;
 
       if (entry.contextTokens && entry.contextTokens > 0) {
         const maxContext = resolveMaxContextTokens(entry.model ?? request.agentConfig.model);
@@ -615,6 +624,21 @@ async function connectWebSocket(
   });
 
   sendEnvelope(ws, { type: 'health' });
+
+  // Send available models to the backend so the mobile app can discover them.
+  (async () => {
+    try {
+      const { execSync } = await import('node:child_process');
+      const raw = execSync('openclaw models list --json', { timeout: 5000, encoding: 'utf-8' });
+      const parsed = JSON.parse(raw);
+      if (parsed.models) {
+        sendEvent(ws, 'models.sync', { models: parsed.models });
+        log?.info?.(`[Whimmy][${accountId}] Synced ${parsed.models.length} model(s)`);
+      }
+    } catch (e) {
+      log?.debug?.(`[Whimmy][${accountId}] Failed to sync models: ${e}`);
+    }
+  })();
 
   ws.on('message', async (data: WebSocket.Data) => {
     if (stopped) return;
