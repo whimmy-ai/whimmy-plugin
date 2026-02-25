@@ -629,11 +629,12 @@ async function connectWebSocket(
   (async () => {
     try {
       const { execSync } = await import('node:child_process');
-      const raw = execSync('openclaw models list --json', { timeout: 5000, encoding: 'utf-8' });
+      const raw = execSync('openclaw models list --all --json', { timeout: 10000, encoding: 'utf-8' });
       const parsed = JSON.parse(raw);
       if (parsed.models) {
-        sendEvent(ws, 'models.sync', { models: parsed.models });
-        log?.info?.(`[Whimmy][${accountId}] Synced ${parsed.models.length} model(s)`);
+        const available = parsed.models.filter((m: any) => m.available !== false);
+        sendEvent(ws, 'models.sync', { models: available });
+        log?.info?.(`[Whimmy][${accountId}] Synced ${available.length} available model(s)`);
       }
     } catch (e) {
       log?.debug?.(`[Whimmy][${accountId}] Failed to sync models: ${e}`);
