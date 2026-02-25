@@ -1064,7 +1064,7 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
         }
       }
 
-      const { stopFn } = await connectWebSocket(conn, cfg, account.accountId, ctx);
+      const { ws, stopFn } = await connectWebSocket(conn, cfg, account.accountId, ctx);
 
       // Wire up abort signal.
       if (abortSignal) {
@@ -1074,6 +1074,13 @@ export const whimmyPlugin: WhimmyChannelPlugin = {
         }
         abortSignal.addEventListener('abort', stopFn);
       }
+
+      // Keep alive: wait for the WebSocket to close before returning.
+      // This tells the gateway the channel is "running" until disconnection,
+      // which enables proper auto-restart on server downtime.
+      await new Promise<void>((resolve) => {
+        ws.once('close', () => resolve());
+      });
 
       return { stop: stopFn };
     },
